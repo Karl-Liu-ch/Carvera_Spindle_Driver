@@ -71,7 +71,7 @@ static constexpr float SPEED_TARGET_STEP_MIN_RPM = 200.0f;
 static constexpr uint32_t SPEED_DROP_CONFIRMATION_MS = 500;
 static constexpr uint32_t IQ_POLL_INTERVAL_MS = 200;
 static constexpr uint32_t POWER_INDEX_CONFIRMATION_MS = 1000;
-static constexpr float power_index = 40000.0f;
+static constexpr float power_index = 52000.0f;
 
 // USB serial and SOLO CANopen
 static constexpr unsigned long PC_BAUDRATE = 115200;
