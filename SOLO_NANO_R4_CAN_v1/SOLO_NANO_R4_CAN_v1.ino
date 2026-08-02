@@ -55,21 +55,19 @@ static constexpr uint32_t MAX_PWM_PERIOD_US = 1500;
 static constexpr uint32_t PWM_EDGE_TIMEOUT_US = 100000;
 
 // Runtime timing
-static constexpr uint32_t COMMAND_INTERVAL_MS = 50;
-static constexpr uint32_t COMMAND_KEEPALIVE_MS = 500;
-static constexpr float COMMAND_CHANGE_THRESHOLD_RPM = 50.0f;
-static constexpr uint32_t SPEED_POLL_INTERVAL_MS = 200;
-static constexpr uint32_t ERROR_POLL_INTERVAL_MS = 500;
+static constexpr uint32_t COMMUNICATION_SLOT_MS = 25;
+static constexpr uint32_t SCHEDULED_ERROR_INTERVAL_MS = 500;
+static constexpr uint32_t FIRST_ERROR_SLOT_OFFSET_MS = 525;
 static constexpr uint32_t PRINT_INTERVAL_MS = 500;
 static constexpr uint32_t ERROR_CLEAR_RETRY_MS = 1000;
 static constexpr uint32_t DRIVE_DISABLE_DELAY_MS = 11000;
 static constexpr uint32_t COMMUNICATION_SAFETY_RETRY_MS = 500;
-static constexpr uint8_t COMMUNICATION_FAILURE_ALARM_THRESHOLD = 5;
+static constexpr uint32_t STARTUP_RETRY_INTERVAL_MS = 100;
+static constexpr uint8_t COMMUNICATION_FAILURE_ALARM_THRESHOLD = 8;
 static constexpr float SPEED_DROP_ALARM_RATIO = 0.10f;
 static constexpr float SPEED_DROP_MONITOR_MIN_RPM = 500.0f;
 static constexpr float SPEED_TARGET_STEP_MIN_RPM = 200.0f;
 static constexpr uint32_t SPEED_DROP_CONFIRMATION_MS = 500;
-static constexpr uint32_t IQ_POLL_INTERVAL_MS = 200;
 static constexpr uint32_t POWER_INDEX_CONFIRMATION_MS = 1000;
 static constexpr float power_index = 52000.0f;
 
@@ -78,7 +76,7 @@ static constexpr unsigned long PC_BAUDRATE = 115200;
 static constexpr uint8_t SOLO_CANOPEN_NODE_ID = 1;
 static constexpr SOLOMotorControllers::CanbusBaudrate CANOPEN_BITRATE =
   SOLOMotorControllers::CanbusBaudrate::RATE_1000;
-static constexpr long CANOPEN_RESPONSE_TIMEOUT_MS = 30;
+static constexpr long CANOPEN_RESPONSE_TIMEOUT_MS = 8;
 
 SOLOMotorControllersCanopenNative *solo = nullptr;
 
@@ -114,6 +112,7 @@ bool speedDropFaultLatched = false;
 bool speedDropMonitorArmed = false;
 bool motorIqValid = false;
 bool powerIndexFaultLatched = false;
+bool soloStartupConfigured = false;
 bool alarmActive = true;
 uint8_t consecutiveCommunicationFailures = 0;
 
@@ -121,20 +120,20 @@ long soloErrorRegister = 0;
 int soloLibraryError = 0;
 int soloMotorDirection = -1;
 
-uint32_t lastCommandTimeMs = 0;
-uint32_t lastSpeedPollTimeMs = 0;
-uint32_t lastIqPollTimeMs = 0;
-uint32_t lastErrorPollTimeMs = 0;
+uint32_t nextCommunicationSlotTimeMs = 0;
+uint32_t communicationSlotIndex = 0;
+uint32_t nextScheduledErrorTimeMs = 0;
 uint32_t lastPrintTimeMs = 0;
 uint32_t lastSuccessfulCommunicationMs = 0;
 uint32_t lastRunRequestedTimeMs = 0;
 uint32_t soloErrorStartTimeMs = 0;
 uint32_t lastCommunicationSafetyRetryMs = 0;
+uint32_t nextStartupRetryTimeMs = 0;
 uint32_t speedDropStartTimeMs = 0;
 uint32_t powerIndexStartTimeMs = 0;
-uint32_t lastSpeedReferenceSentTimeMs = 0;
 float lastSpeedReferenceSentRpm = -1.0f;
 float lastSpeedDropMonitorTargetRpm = 0.0f;
+bool nextTelemetryReadIsIq = true;
 
 // ---------------------------------------------------------------------------
 // PWM input
@@ -265,7 +264,7 @@ void recordCommunicationFailure()
 
 bool communicationFailureLimitExceeded()
 {
-  return consecutiveCommunicationFailures >
+  return consecutiveCommunicationFailures >=
          COMMUNICATION_FAILURE_ALARM_THRESHOLD;
 }
 
@@ -389,7 +388,6 @@ bool sendSoloSpeed(float rpm)
   if (ok) {
     recordCommunicationSuccess();
     lastSpeedReferenceSentRpm = static_cast<float>(commandRpm);
-    lastSpeedReferenceSentTimeMs = millis();
   }
   else {
     recordCommunicationFailure();
@@ -504,6 +502,103 @@ bool initializeSolo()
   }
 
   return applySoloStartupConfiguration();
+}
+
+bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs)
+{
+  return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
+}
+
+void executeScheduledSpeedCommand(uint32_t nowMs)
+{
+  const bool runRequested =
+    pwmSignalValid &&
+    filteredDuty >= START_DUTY_THRESHOLD &&
+    !soloHasError &&
+    !soloFaultLatched &&
+    !speedDropFaultLatched &&
+    !powerIndexFaultLatched &&
+    soloStartupConfigured &&
+    !communicationFaultLatched;
+
+  if (runRequested) {
+    if (!soloDriveEnabled) {
+      setSoloDriveEnabled(true);
+    }
+
+    if (soloDriveEnabled) {
+      // The speed reference is deliberately sent in every 50 ms command slot.
+      sendSoloSpeed(targetMotorRpm);
+    }
+    lastRunRequestedTimeMs = nowMs;
+  }
+  else {
+    sendSoloSpeed(0.0f);
+
+    if (soloDriveEnabled &&
+        nowMs - lastRunRequestedTimeMs >= DRIVE_DISABLE_DELAY_MS) {
+      setSoloDriveEnabled(false);
+    }
+  }
+}
+
+void runCommunicationSchedule(uint32_t nowMs)
+{
+  if (!deadlineReached(nowMs, nextCommunicationSlotTimeMs)) {
+    return;
+  }
+
+  // Run at most one scheduled SOLO operation per loop. If the loop was late,
+  // skip expired slots instead of issuing a burst of catch-up transactions.
+  const uint32_t slotsLate =
+    (nowMs - nextCommunicationSlotTimeMs) / COMMUNICATION_SLOT_MS;
+  communicationSlotIndex += slotsLate;
+  nextCommunicationSlotTimeMs +=
+    (slotsLate + 1U) * COMMUNICATION_SLOT_MS;
+  const uint32_t slotIndex = communicationSlotIndex++;
+
+  if (communicationFaultLatched) {
+    return;
+  }
+
+  if (!soloStartupConfigured) {
+    if (deadlineReached(nowMs, nextStartupRetryTimeMs)) {
+      nextStartupRetryTimeMs = nowMs + STARTUP_RETRY_INTERVAL_MS;
+      if (initializeSolo()) {
+        soloStartupConfigured = true;
+        Serial.println("SOLO startup configuration retry succeeded");
+      }
+      else {
+        Serial.print("SOLO startup configuration retry failed, consecutive: ");
+        Serial.println(consecutiveCommunicationFailures);
+      }
+    }
+    return;
+  }
+
+  if ((slotIndex & 1U) == 0U) {
+    executeScheduledSpeedCommand(nowMs);
+    return;
+  }
+
+  if (deadlineReached(nowMs, nextScheduledErrorTimeMs)) {
+    pollSoloErrors();
+
+    const uint32_t elapsedIntervals =
+      (nowMs - nextScheduledErrorTimeMs) /
+        SCHEDULED_ERROR_INTERVAL_MS + 1U;
+    nextScheduledErrorTimeMs +=
+      elapsedIntervals * SCHEDULED_ERROR_INTERVAL_MS;
+    return;
+  }
+
+  if (nextTelemetryReadIsIq) {
+    pollSoloIq();
+  }
+  else {
+    pollSoloSpeed();
+  }
+  nextTelemetryReadIsIq = !nextTelemetryReadIsIq;
 }
 
 void updateSpeedDropMonitor(uint32_t nowMs)
@@ -711,16 +806,24 @@ void setup()
   Serial.println("Nano R4 Carvera / SOLO CANopen interface startup");
 
   if (initializeSolo()) {
+    soloStartupConfigured = true;
     Serial.println("SOLO communication established");
     setCarveraAlarm(false);
   }
   else {
     Serial.print("SOLO initialisation failed, error: ");
     Serial.println(soloLibraryError);
-    setCarveraAlarm(true);
+    Serial.println("Startup will retry; alarm requires 8 consecutive failures");
+    setCarveraAlarm(false);
   }
 
-  lastRunRequestedTimeMs = millis();
+  const uint32_t schedulerStartTimeMs = millis();
+  lastRunRequestedTimeMs = schedulerStartTimeMs;
+  nextCommunicationSlotTimeMs = schedulerStartTimeMs;
+  nextScheduledErrorTimeMs =
+    schedulerStartTimeMs + FIRST_ERROR_SLOT_OFFSET_MS;
+  nextStartupRetryTimeMs =
+    schedulerStartTimeMs + STARTUP_RETRY_INTERVAL_MS;
 }
 
 void loop()
@@ -750,67 +853,9 @@ void loop()
 
   const uint32_t nowMs = millis();
 
-  // Once a communication fault is latched, stop all normal CANopen traffic.
-  // The dedicated safety-recovery block below is then the only CANopen caller.
-  if (!communicationFaultLatched &&
-      nowMs - lastCommandTimeMs >= COMMAND_INTERVAL_MS) {
-    lastCommandTimeMs = nowMs;
-
-    const bool runRequested =
-      pwmSignalValid &&
-      filteredDuty >= START_DUTY_THRESHOLD &&
-      !soloHasError &&
-      !soloFaultLatched &&
-      !speedDropFaultLatched &&
-      !powerIndexFaultLatched &&
-      !communicationFaultLatched;
-
-    if (runRequested) {
-      if (!soloDriveEnabled) {
-        setSoloDriveEnabled(true);
-      }
-
-      if (soloDriveEnabled) {
-        const bool referenceChanged =
-          lastSpeedReferenceSentRpm < 0.0f ||
-          fabsf(targetMotorRpm - lastSpeedReferenceSentRpm) >=
-            COMMAND_CHANGE_THRESHOLD_RPM;
-        const bool keepaliveDue =
-          nowMs - lastSpeedReferenceSentTimeMs >= COMMAND_KEEPALIVE_MS;
-
-        if (referenceChanged || keepaliveDue) {
-          sendSoloSpeed(targetMotorRpm);
-        }
-      }
-      lastRunRequestedTimeMs = nowMs;
-    }
-    else {
-      sendSoloSpeed(0.0f);
-
-      if (soloDriveEnabled &&
-          nowMs - lastRunRequestedTimeMs >= DRIVE_DISABLE_DELAY_MS) {
-        setSoloDriveEnabled(false);
-      }
-    }
-  }
-
-  if (!communicationFaultLatched &&
-      nowMs - lastSpeedPollTimeMs >= SPEED_POLL_INTERVAL_MS) {
-    lastSpeedPollTimeMs = nowMs;
-    pollSoloSpeed();
-  }
-
-  if (!communicationFaultLatched &&
-      nowMs - lastIqPollTimeMs >= IQ_POLL_INTERVAL_MS) {
-    lastIqPollTimeMs = nowMs;
-    pollSoloIq();
-  }
-
-  if (!communicationFaultLatched &&
-      nowMs - lastErrorPollTimeMs >= ERROR_POLL_INTERVAL_MS) {
-    lastErrorPollTimeMs = nowMs;
-    pollSoloErrors();
-  }
+  // Normal CANopen traffic follows one 25 ms slotted schedule. The dedicated
+  // safety-recovery block below remains the only caller after a comm fault.
+  runCommunicationSchedule(nowMs);
 
   updateSpeedDropMonitor(nowMs);
   updatePowerIndexMonitor(nowMs);
@@ -896,4 +941,3 @@ void loop()
     printStatus();
   }
 }
-
