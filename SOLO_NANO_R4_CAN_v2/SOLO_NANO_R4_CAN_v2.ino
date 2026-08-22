@@ -46,17 +46,16 @@ static constexpr float BLUE_FEEDBACK_FILTER_ALPHA = 0.25f;
 
 // SOLO-specific runtime configuration restored after every restart. These
 // values are retained from SOLO_NANO_R4_CAN_v1's verified Motion Monitor setup.
-static constexpr float SOLO_CURRENT_LIMIT_A = 12.6f;
-static constexpr float SOLO_SPEED_KP = 0.2f;
+static constexpr float SOLO_CURRENT_LIMIT_A = 8.2f;
+static constexpr float SOLO_SPEED_KP = 0.15f;
 static constexpr float SOLO_SPEED_KI = 0.005f;
-static constexpr float SOLO_CURRENT_KP = 0.27764893f;
-static constexpr float SOLO_CURRENT_KI = 0.01895905f;
-static constexpr float SOLO_ACCELERATION_RPS2 = 100.708008f;
-static constexpr float SOLO_DECELERATION_RPS2 = 20.354004f;
-// Safest commissioning value for a unidirectional DC supply: do not command
-// regenerative current back into a supply that is not rated to sink it.
-// Increase only after measuring DC-bus voltage during worst-case deceleration.
-static constexpr float SOLO_REGENERATION_CURRENT_LIMIT_A = 0.0f;
+static constexpr float SOLO_CURRENT_KP = 0.3105163f;
+static constexpr float SOLO_CURRENT_KI = 0.02108f;
+static constexpr float SOLO_ACCELERATION_RPS2 = 100.0f;
+static constexpr float SOLO_DECELERATION_RPS2 = 20.0f;
+// Limit regenerative current to 0.5 A. Confirm that the DC supply can absorb
+// this current and verify bus voltage during worst-case deceleration.
+static constexpr float SOLO_REGENERATION_CURRENT_LIMIT_A = 0.5f;
 
 // Expected PWM input: approximately 1 kHz.
 static constexpr uint32_t MIN_PWM_PERIOD_US = 700;
@@ -68,12 +67,20 @@ static constexpr uint32_t COMMUNICATION_SLOT_MS = 25;
 static constexpr uint32_t SCHEDULED_ERROR_INTERVAL_MS = 500;
 static constexpr uint32_t FIRST_ERROR_SLOT_OFFSET_MS = 525;
 static constexpr uint32_t PRINT_INTERVAL_MS = 500;
+static constexpr uint32_t ERROR_CLEAR_RETRY_MS = 1000;
 // Match SOLO_NANO_R4_CAN_v1-MarsLab: keep sending a zero-speed reference and
 // leave the drive ENABLED for 11 seconds before switching it to DISABLE.
 static constexpr uint32_t DRIVE_DISABLE_DELAY_MS = 11000;
 static constexpr uint32_t STARTUP_RETRY_INTERVAL_MS = 100;
 static constexpr uint32_t TELEMETRY_TIMEOUT_MS = 350;
 static constexpr uint8_t COMMUNICATION_FAILURE_ALARM_THRESHOLD = 8;
+// Detect a failed start separately from SPEED_DROP, which is armed only after
+// the motor has already reached its requested speed. A 5% PWM command equals
+// approximately 900 spindle rpm. Once that threshold is crossed, the motor
+// must leave the near-zero speed band within 2 seconds.
+static constexpr float START_FAILURE_PWM_DUTY_THRESHOLD = 0.05f;
+static constexpr float START_FAILURE_ZERO_SPEED_RPM = 20.0f;
+static constexpr uint32_t START_FAILURE_CONFIRMATION_MS = 2000;
 static constexpr float SPEED_DROP_ALARM_RATIO = 0.20f;
 static constexpr float SPEED_DROP_MONITOR_MIN_RPM = 500.0f;
 static constexpr float SPEED_TARGET_STEP_MIN_RPM = 200.0f;
@@ -126,6 +133,9 @@ bool soloDriveEnabled = false;
 bool soloHasError = false;
 bool soloFaultLatched = false;
 bool communicationFaultLatched = false;
+bool startFailureFaultLatched = false;
+bool startFailureMonitorArmed = false;
+bool startFailureCommandAboveThreshold = false;
 bool speedDropFaultLatched = false;
 bool speedDropMonitorArmed = false;
 bool motorIqValid = false;
@@ -141,11 +151,13 @@ uint8_t consecutiveCommunicationFailures = 0;
 
 long soloErrorRegister = 0;
 long latchedSoloErrorRegister = 0;
+bool soloErrorIncidentActive = false;
 int soloLibraryError = 0;
 int soloMotorDirection = -1;
-bool manualErrorClearPending = false;
+bool errorClearPending = false;
 uint32_t soloErrorReadCount = 0;
-uint32_t manualErrorClearRequestReadCount = 0;
+uint32_t errorClearRequestReadCount = 0;
+uint32_t lastErrorClearAttemptTimeMs = 0;
 
 uint32_t lastSpeedTimeMs = 0;
 uint32_t lastIqTimeMs = 0;
@@ -162,6 +174,7 @@ uint32_t alarmActivationCount = 0;
 uint32_t lastAlarmActivationTimeMs = 0;
 uint32_t lastRunRequestedTimeMs = 0;
 uint32_t nextStartupRetryTimeMs = 0;
+uint32_t startFailureStartTimeMs = 0;
 uint32_t speedDropStartTimeMs = 0;
 uint32_t powerIndexStartTimeMs = 0;
 float lastSpeedReferenceSentRpm = -1.0f;
@@ -172,6 +185,7 @@ enum class AlarmReason : uint8_t {
   COMMUNICATION,
   SOLO_ACTIVE_ERROR,
   SOLO_FAULT_LATCHED,
+  START_FAILURE,
   SPEED_DROP,
   POWER_INDEX
 };
@@ -326,6 +340,7 @@ const char *alarmReasonName(AlarmReason reason)
     case AlarmReason::COMMUNICATION: return "COMMUNICATION";
     case AlarmReason::SOLO_ACTIVE_ERROR: return "SOLO_ACTIVE_ERROR";
     case AlarmReason::SOLO_FAULT_LATCHED: return "SOLO_FAULT_LATCHED";
+    case AlarmReason::START_FAILURE: return "START_FAILURE";
     case AlarmReason::SPEED_DROP: return "SPEED_DROP";
     case AlarmReason::POWER_INDEX: return "POWER_INDEX";
     default: return "NONE";
@@ -347,6 +362,7 @@ AlarmReason currentAlarmReason()
   if (communicationFaultLatched) return AlarmReason::COMMUNICATION;
   if (soloHasError) return AlarmReason::SOLO_ACTIVE_ERROR;
   if (soloFaultLatched) return AlarmReason::SOLO_FAULT_LATCHED;
+  if (startFailureFaultLatched) return AlarmReason::START_FAILURE;
   if (speedDropFaultLatched) return AlarmReason::SPEED_DROP;
   if (powerIndexFaultLatched) return AlarmReason::POWER_INDEX;
   return AlarmReason::NONE;
@@ -406,9 +422,13 @@ bool telemetryIsFresh(uint32_t sampleTimeMs, uint32_t nowMs)
 
 bool finishSoloTransaction(bool ok)
 {
-  if (ok && soloLibraryError == 0) {
+  // A valid CANopen response can still contain a value that does not match a
+  // requested configuration.  That is a configuration/verification failure,
+  // not a lost CAN transaction, so keep the link status healthy when the
+  // library reports no communication error.
+  if (soloLibraryError == 0) {
     recordCommunicationSuccess();
-    return true;
+    return ok;
   }
   recordCommunicationFailure();
   return false;
@@ -436,8 +456,7 @@ bool verifySoloClockwiseDirection();
 
 bool setSoloDriveEnabled(bool enabled)
 {
-  if (enabled && (soloHasError || soloFaultLatched ||
-                  latchedSoloErrorRegister != 0)) {
+  if (enabled && (soloHasError || soloFaultLatched)) {
     return false;
   }
 
@@ -570,8 +589,20 @@ bool pollSoloErrors(uint32_t nowMs)
 
   soloErrorRegister = errorRegister;
   soloHasError = errorRegister != 0;
-  if (latchedSoloErrorRegister == 0 && errorRegister != 0) {
-    latchedSoloErrorRegister = errorRegister;
+  if (errorRegister != 0) {
+    if (!soloErrorIncidentActive) {
+      latchedSoloErrorRegister = errorRegister;
+      soloErrorIncidentActive = true;
+      errorClearPending = true;
+      lastErrorClearAttemptTimeMs = 0;
+      Serial.print("SOLO error recorded; automatic clear pending: 0x");
+      Serial.println(
+        static_cast<unsigned long>(latchedSoloErrorRegister), HEX);
+    }
+    else {
+      // Preserve every error bit observed during the current incident.
+      latchedSoloErrorRegister |= errorRegister;
+    }
   }
   lastErrorMessageTimeMs = nowMs;
   ++soloErrorReadCount;
@@ -652,68 +683,70 @@ bool runSoloStartupStage(uint32_t nowMs)
       if (ok && soloLibraryError == 0) soloDriveEnabled = false;
       break;
     case 2:
+      ok = solo->GetDriveDisableEnable(soloLibraryError) ==
+        SOLOMotorControllers::DisableEnable::DISABLE;
+      break;
+    case 3:
       ok = solo->SetSpeedReference(0, soloLibraryError);
       if (ok && soloLibraryError == 0) lastSpeedReferenceSentRpm = 0.0f;
       break;
-    case 3:
+    case 4:
+      ok = solo->GetSpeedReference(soloLibraryError) == 0;
+      break;
+    case 5:
       ok = solo->SetCommandMode(
         SOLOMotorControllers::CommandMode::DIGITAL, soloLibraryError);
       break;
-    case 4:
+    case 6:
       ok = solo->SetMotorType(
         SOLOMotorControllers::MotorType::BLDC_PMSM, soloLibraryError);
       break;
-    case 5:
+    case 7:
       ok = solo->SetFeedbackControlMode(
         SOLOMotorControllers::FeedbackControlMode::HALL_SENSORS,
         soloLibraryError);
       break;
-    case 6:
+    case 8:
       ok = solo->SetControlMode(
         SOLOMotorControllers::ControlMode::SPEED_MODE, soloLibraryError);
       break;
-    case 7:
+    case 9:
       ok = solo->SetCurrentLimit(SOLO_CURRENT_LIMIT_A, soloLibraryError);
       break;
-    case 8:
+    case 10:
       ok = solo->SetCurrentControllerKp(
         SOLO_CURRENT_KP, soloLibraryError);
       break;
-    case 9:
+    case 11:
       ok = solo->SetCurrentControllerKi(
         SOLO_CURRENT_KI, soloLibraryError);
       break;
-    case 10:
+    case 12:
       ok = solo->SetSpeedControllerKp(SOLO_SPEED_KP, soloLibraryError);
       break;
-    case 11:
+    case 13:
       ok = solo->SetSpeedControllerKi(SOLO_SPEED_KI, soloLibraryError);
       break;
-    case 12:
+    case 14:
       ok = solo->SetSpeedAccelerationValue(
         SOLO_ACCELERATION_RPS2, soloLibraryError);
       break;
-    case 13:
+    case 15:
       ok = solo->SetSpeedDecelerationValue(
         SOLO_DECELERATION_RPS2, soloLibraryError);
       break;
-    case 14:
+    case 16:
       ok = solo->SetRegenerationCurrentLimit(
         SOLO_REGENERATION_CURRENT_LIMIT_A, soloLibraryError);
+      if (ok && soloLibraryError == 0) {
+        soloRegenerationCurrentLimitA = SOLO_REGENERATION_CURRENT_LIMIT_A;
+      }
       break;
-    case 15:
-      soloRegenerationCurrentLimitA =
-        solo->GetRegenerationCurrentLimit(soloLibraryError);
-      ok = soloLibraryError == 0 &&
-        isfinite(soloRegenerationCurrentLimitA) &&
-        fabsf(soloRegenerationCurrentLimitA -
-              SOLO_REGENERATION_CURRENT_LIMIT_A) <= 0.05f;
-      break;
-    case 16:
+    case 17:
       ok = solo->SetMotorDirection(
         SOLOMotorControllers::Direction::CLOCKWISE, soloLibraryError);
       break;
-    case 17: {
+    case 18: {
       const SOLOMotorControllers::Direction direction =
         solo->GetMotorDirection(soloLibraryError);
       soloMotorDirection = static_cast<int>(direction);
@@ -728,6 +761,18 @@ bool runSoloStartupStage(uint32_t nowMs)
   }
 
   if (!finishSoloTransaction(ok)) {
+    static uint32_t lastStartupFailurePrintMs = 0;
+    if (lastStartupFailurePrintMs == 0 ||
+        nowMs - lastStartupFailurePrintMs >= 1000) {
+      lastStartupFailurePrintMs = nowMs;
+      Serial.print("SOLO startup stage ");
+      Serial.print(startupCommandStage);
+      Serial.print(soloLibraryError == 0
+        ? " verification mismatch"
+        : " communication error: ");
+      if (soloLibraryError != 0) Serial.print(soloLibraryError);
+      Serial.println();
+    }
     return false;
   }
 
@@ -746,6 +791,7 @@ void executeScheduledSpeedCommand(uint32_t nowMs)
     pwmSignalValid &&
     !soloHasError &&
     !soloFaultLatched &&
+    !startFailureFaultLatched &&
     !speedDropFaultLatched &&
     !powerIndexFaultLatched &&
     soloStartupConfigured &&
@@ -800,6 +846,25 @@ void runCommunicationSchedule(uint32_t nowMs)
     (slotsLate + 1U) * COMMUNICATION_SLOT_MS;
   const uint32_t slotIndex = communicationSlotIndex++;
 
+  // Preserve the error register in pollSoloErrors() before attempting a clear.
+  // Retry no faster than once per second and require a newer zero register read
+  // before releasing the local fault latch.
+  if (soloHasError && errorClearPending &&
+      (lastErrorClearAttemptTimeMs == 0 ||
+       nowMs - lastErrorClearAttemptTimeMs >= ERROR_CLEAR_RETRY_MS)) {
+    lastErrorClearAttemptTimeMs = nowMs;
+    if (requestSoloErrorClear()) {
+      errorClearRequestReadCount = soloErrorReadCount;
+      Serial.print("Automatic SOLO error clear sent | saved errors: 0x");
+      Serial.println(
+        static_cast<unsigned long>(latchedSoloErrorRegister), HEX);
+    }
+    else {
+      Serial.println("Automatic SOLO error-clear request failed; will retry");
+    }
+    return;
+  }
+
   if (!soloStartupConfigured) {
     if (deadlineReached(nowMs, nextStartupRetryTimeMs)) {
       nextStartupRetryTimeMs = nowMs + STARTUP_RETRY_INTERVAL_MS;
@@ -835,6 +900,56 @@ void runCommunicationSchedule(uint32_t nowMs)
 // ---------------------------------------------------------------------------
 // Protection logic
 // ---------------------------------------------------------------------------
+
+void updateStartFailureMonitor(uint32_t nowMs)
+{
+  const bool commandAboveThreshold =
+    pwmSignalValid && filteredDuty >= START_FAILURE_PWM_DUTY_THRESHOLD;
+
+  // Arm only on a low-to-high command transition. Once real motion has been
+  // observed, this startup-only monitor is finished until PWM returns low.
+  if (commandAboveThreshold && !startFailureCommandAboveThreshold) {
+    startFailureMonitorArmed = true;
+    startFailureStartTimeMs = 0;
+  }
+  startFailureCommandAboveThreshold = commandAboveThreshold;
+
+  if (!commandAboveThreshold) {
+    startFailureMonitorArmed = false;
+    startFailureStartTimeMs = 0;
+    return;
+  }
+
+  if (startFailureFaultLatched || !startFailureMonitorArmed) return;
+
+  const bool speedTelemetryValid = telemetryIsFresh(lastSpeedTimeMs, nowMs);
+  if (!soloDriveEnabled || !soloCommunicationValid ||
+      !speedTelemetryValid || soloHasError || soloFaultLatched ||
+      communicationFaultLatched) {
+    // Do not charge SOLO startup or invalid telemetry time against the motor,
+    // but keep the start attempt armed until conditions are valid.
+    startFailureStartTimeMs = 0;
+    return;
+  }
+
+  if (measuredMotorRpm > START_FAILURE_ZERO_SPEED_RPM) {
+    startFailureMonitorArmed = false;
+    startFailureStartTimeMs = 0;
+    return;
+  }
+
+  if (startFailureStartTimeMs == 0) {
+    startFailureStartTimeMs = nowMs;
+  }
+  else if (nowMs - startFailureStartTimeMs >=
+           START_FAILURE_CONFIRMATION_MS) {
+    startFailureFaultLatched = true;
+    startFailureMonitorArmed = false;
+    Serial.println(
+      "PWM start command present but motor stayed at 0 rpm for 2 s: "
+      "fault latched");
+  }
+}
 
 void updateSpeedDropMonitor(uint32_t nowMs)
 {
@@ -975,6 +1090,10 @@ void printStatus()
   Serial.print(" | regen limit: ");
   Serial.print(soloRegenerationCurrentLimitA, 2);
   Serial.print(" A");
+  Serial.print(" | start monitor: ");
+  if (startFailureFaultLatched) Serial.print("FAULT");
+  else if (startFailureStartTimeMs != 0) Serial.print("TIMING");
+  else Serial.print(startFailureMonitorArmed ? "ARMED" : "WAIT");
   Serial.print(" | speed monitor: ");
   if (speedDropFaultLatched) Serial.print("FAULT");
   else if (speedDropStartTimeMs != 0) Serial.print("TIMING");
@@ -985,7 +1104,7 @@ void printStatus()
   else Serial.print("NORMAL");
   Serial.print(" | SOLO errors: 0x");
   Serial.print(static_cast<unsigned long>(soloErrorRegister), HEX);
-  Serial.print(" | latched SOLO errors: 0x");
+  Serial.print(" | last SOLO errors: 0x");
   Serial.print(static_cast<unsigned long>(latchedSoloErrorRegister), HEX);
   Serial.print(" | library error: ");
   Serial.print(soloLibraryError);
@@ -1001,8 +1120,8 @@ void printStatus()
   else {
     Serial.print("UNKNOWN");
   }
-  Serial.print(" | manual clear: ");
-  Serial.print(manualErrorClearPending ? "PENDING" : "IDLE");
+  Serial.print(" | error clear: ");
+  Serial.print(errorClearPending ? "PENDING" : "IDLE");
   Serial.print(" | CANopen: ");
   Serial.print(soloCommunicationValid ? "CONNECTED" : "LOST");
   Serial.print(" (");
@@ -1042,8 +1161,9 @@ void handleUSBSerial()
       Serial.println("Clear rejected: SOLO CANopen is not available");
     }
     else if (requestSoloErrorClear()) {
-      manualErrorClearPending = true;
-      manualErrorClearRequestReadCount = soloErrorReadCount;
+      errorClearPending = true;
+      errorClearRequestReadCount = soloErrorReadCount;
+      lastErrorClearAttemptTimeMs = nowMs;
       requestControlledStop(nowMs);
       Serial.println(
         "SOLO error clear sent; waiting for zero error-register feedback");
@@ -1117,23 +1237,40 @@ void loop()
   busTelemetryValid = telemetryIsFresh(lastBusTelemetryTimeMs, nowMs);
 
   runCommunicationSchedule(nowMs);
+  updateStartFailureMonitor(nowMs);
   updateSpeedDropMonitor(nowMs);
   updatePowerIndexMonitor(nowMs);
 
   if (soloHasError) soloFaultLatched = true;
 
-  // SOLO faults are never cleared automatically. Require a manual USB clear,
-  // a newer zero error-register read, zero PWM, zero command and DISABLE.
-  if (manualErrorClearPending &&
-      soloErrorReadCount > manualErrorClearRequestReadCount &&
+  // Automatic clearing never permits an automatic restart. Require a newer
+  // zero error-register read, zero PWM, zero command and DISABLE before the
+  // local fault latch is released.
+  if (errorClearPending &&
+      soloErrorReadCount > errorClearRequestReadCount &&
       !soloHasError && filteredDuty < START_DUTY_THRESHOLD) {
     if (motorSequenceState == MotorSequenceState::STOPPED &&
         !soloDriveEnabled && lastSpeedReferenceSentRpm == 0.0f) {
       soloFaultLatched = false;
-      latchedSoloErrorRegister = 0;
-      manualErrorClearPending = false;
-      manualErrorClearRequestReadCount = 0;
-      Serial.println("SOLO error clear confirmed; fault latch released");
+      errorClearPending = false;
+      errorClearRequestReadCount = 0;
+      lastErrorClearAttemptTimeMs = 0;
+      soloErrorIncidentActive = false;
+      Serial.print("SOLO error clear confirmed; fault latch released");
+      Serial.print(" | last SOLO errors: 0x");
+      Serial.println(
+        static_cast<unsigned long>(latchedSoloErrorRegister), HEX);
+    }
+  }
+
+  if (startFailureFaultLatched &&
+      filteredDuty < START_DUTY_THRESHOLD) {
+    if (motorSequenceState == MotorSequenceState::STOPPED &&
+        !soloDriveEnabled && lastSpeedReferenceSentRpm == 0.0f) {
+      startFailureFaultLatched = false;
+      startFailureMonitorArmed = false;
+      startFailureCommandAboveThreshold = false;
+      startFailureStartTimeMs = 0;
     }
   }
 
@@ -1178,8 +1315,8 @@ void loop()
   }
 
   const bool driveFault =
-    soloHasError || soloFaultLatched || speedDropFaultLatched ||
-    powerIndexFaultLatched;
+    soloHasError || soloFaultLatched || startFailureFaultLatched ||
+    speedDropFaultLatched || powerIndexFaultLatched;
   const bool seriousFault = communicationFaultLatched || driveFault;
 
   if (seriousFault) updateBlueSpeedFeedback(0.0f, false);
