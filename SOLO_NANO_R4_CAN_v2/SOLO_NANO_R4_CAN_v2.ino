@@ -15,7 +15,7 @@
   SOLO must already be commissioned and saved in Motion Monitor with CANopen
   node ID 1 and CAN bitrate 1 Mbit/s. The sketch restores the verified motor,
   Hall-feedback, controller-gain and acceleration settings after every Nano or
-  SOLO restart.
+  SOLO restart. Motor identification can be requested explicitly over USB.
 */
 
 #include <Arduino.h>
@@ -36,8 +36,8 @@ static constexpr uint8_t RED_ALARM_SIGNAL_PIN = 6;
 
 // Spindle and motor values mirror ODRIVE_NANO_R4_CAN_v3_HALL.
 static constexpr float GEAR_RATIO = 1.635f;
-static constexpr float MAX_SPINDLE_RPM = 18000.0f;
-static constexpr float MAX_MOTOR_RPM = 11500.0f;
+static constexpr float MAX_SPINDLE_RPM = 16000.0f;
+static constexpr float MAX_MOTOR_RPM = 9700.0f;
 static constexpr float SPEED_FEEDBACK_PPR = 12.0f;
 static constexpr float START_DUTY_THRESHOLD = 0.002f;
 static constexpr float FILTER_ALPHA = 0.20f;
@@ -47,12 +47,14 @@ static constexpr float BLUE_FEEDBACK_FILTER_ALPHA = 0.25f;
 // SOLO-specific runtime configuration restored after every restart. These
 // values are retained from SOLO_NANO_R4_CAN_v1's verified Motion Monitor setup.
 static constexpr float SOLO_CURRENT_LIMIT_A = 8.2f;
-static constexpr float SOLO_SPEED_KP = 0.15f;
-static constexpr float SOLO_SPEED_KI = 0.005f;
-static constexpr float SOLO_CURRENT_KP = 0.3105163f;
-static constexpr float SOLO_CURRENT_KI = 0.02108f;
+static constexpr float SOLO_SPEED_KP = 0.2f;
+static constexpr float SOLO_SPEED_KI = 0.002f;
+// static constexpr float SOLO_CURRENT_KP = 0.2805163f;
+// static constexpr float SOLO_CURRENT_KI = 0.01908f;
+static constexpr float SOLO_CURRENT_KP = 0.4925461f;
+static constexpr float SOLO_CURRENT_KI = 0.0243301f;
 static constexpr float SOLO_ACCELERATION_RPS2 = 100.0f;
-static constexpr float SOLO_DECELERATION_RPS2 = 20.0f;
+static constexpr float SOLO_DECELERATION_RPS2 = 25.0f;
 // Limit regenerative current to 0.5 A. Confirm that the DC supply can absorb
 // this current and verify bus voltage during worst-case deceleration.
 static constexpr float SOLO_REGENERATION_CURRENT_LIMIT_A = 0.5f;
@@ -72,6 +74,9 @@ static constexpr uint32_t ERROR_CLEAR_RETRY_MS = 1000;
 // leave the drive ENABLED for 11 seconds before switching it to DISABLE.
 static constexpr uint32_t DRIVE_DISABLE_DELAY_MS = 11000;
 static constexpr uint32_t STARTUP_RETRY_INTERVAL_MS = 100;
+// SOLO's example requires at least 2 s for motor identification. Give it some
+// margin, while keeping the startup state machine non-blocking.
+static constexpr uint32_t MOTOR_IDENTIFICATION_WAIT_MS = 2500;
 static constexpr uint32_t TELEMETRY_TIMEOUT_MS = 350;
 static constexpr uint8_t COMMUNICATION_FAILURE_ALARM_THRESHOLD = 8;
 // Detect a failed start separately from SPEED_DROP, which is armed only after
@@ -126,6 +131,8 @@ float blueOutputFrequencyHz = 0.0f;
 float filteredBlueFeedbackFrequencyHz = 0.0f;
 float soloBusVoltageV = 0.0f;
 float soloRegenerationCurrentLimitA = -1.0f;
+float identifiedCurrentKp = NAN;
+float identifiedCurrentKi = NAN;
 
 bool pwmSignalValid = false;
 bool soloCommunicationValid = false;
@@ -174,6 +181,7 @@ uint32_t alarmActivationCount = 0;
 uint32_t lastAlarmActivationTimeMs = 0;
 uint32_t lastRunRequestedTimeMs = 0;
 uint32_t nextStartupRetryTimeMs = 0;
+uint32_t motorIdentificationStartTimeMs = 0;
 uint32_t startFailureStartTimeMs = 0;
 uint32_t speedDropStartTimeMs = 0;
 uint32_t powerIndexStartTimeMs = 0;
@@ -207,6 +215,18 @@ bool recoveryDisableConfirmed = false;
 bool recoverySpeedConfirmed = false;
 bool recoveryIqConfirmed = false;
 bool recoveryErrorConfirmed = false;
+
+enum class MotorIdentificationState : uint8_t {
+  IDLE,
+  START_REQUESTED,
+  WAITING,
+  READ_KP,
+  READ_KI,
+  ABORT_REQUESTED
+};
+
+MotorIdentificationState motorIdentificationState =
+  MotorIdentificationState::IDLE;
 
 // ---------------------------------------------------------------------------
 // PWM input
@@ -785,6 +805,83 @@ bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs)
   return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
 }
 
+void runMotorIdentification(uint32_t nowMs)
+{
+  if (filteredDuty >= START_DUTY_THRESHOLD &&
+      motorIdentificationState != MotorIdentificationState::ABORT_REQUESTED) {
+    motorIdentificationState = MotorIdentificationState::ABORT_REQUESTED;
+  }
+
+  soloLibraryError = 0;
+  bool ok = false;
+  switch (motorIdentificationState) {
+    case MotorIdentificationState::START_REQUESTED:
+      ok = solo->MotorParametersIdentification(
+        SOLOMotorControllers::Action::START, soloLibraryError);
+      if (finishSoloTransaction(ok)) {
+        motorIdentificationStartTimeMs = nowMs;
+        motorIdentificationState = MotorIdentificationState::WAITING;
+        Serial.println("SOLO motor identification started; waiting 2.5 s");
+      }
+      else {
+        Serial.print("Motor identification start failed; library error: ");
+        Serial.println(soloLibraryError);
+        motorIdentificationState = MotorIdentificationState::IDLE;
+      }
+      return;
+
+    case MotorIdentificationState::WAITING:
+      if (nowMs - motorIdentificationStartTimeMs >=
+          MOTOR_IDENTIFICATION_WAIT_MS) {
+        motorIdentificationState = MotorIdentificationState::READ_KP;
+      }
+      return;
+
+    case MotorIdentificationState::READ_KP: {
+      const float currentKp = solo->GetCurrentControllerKp(soloLibraryError);
+      ok = soloLibraryError == 0 && isfinite(currentKp) && currentKp > 0.0f;
+      if (finishSoloTransaction(ok)) {
+        identifiedCurrentKp = currentKp;
+        motorIdentificationState = MotorIdentificationState::READ_KI;
+      }
+      else {
+        Serial.println("Motor identification failed to read a valid current Kp");
+        motorIdentificationState = MotorIdentificationState::IDLE;
+      }
+      return;
+    }
+
+    case MotorIdentificationState::READ_KI: {
+      const float currentKi = solo->GetCurrentControllerKi(soloLibraryError);
+      ok = soloLibraryError == 0 && isfinite(currentKi) && currentKi > 0.0f;
+      if (finishSoloTransaction(ok)) {
+        identifiedCurrentKi = currentKi;
+        Serial.print("SOLO motor identification complete | current Kp: ");
+        Serial.print(identifiedCurrentKp, 7);
+        Serial.print(" | current Ki: ");
+        Serial.println(identifiedCurrentKi, 7);
+      }
+      else {
+        Serial.println("Motor identification failed to read a valid current Ki");
+      }
+      motorIdentificationState = MotorIdentificationState::IDLE;
+      return;
+    }
+
+    case MotorIdentificationState::ABORT_REQUESTED:
+      ok = solo->MotorParametersIdentification(
+        SOLOMotorControllers::Action::STOP, soloLibraryError);
+      finishSoloTransaction(ok);
+      Serial.println(
+        "Motor identification aborted because PWM command is not zero");
+      motorIdentificationState = MotorIdentificationState::IDLE;
+      return;
+
+    default:
+      return;
+  }
+}
+
 void executeScheduledSpeedCommand(uint32_t nowMs)
 {
   const bool safeToRun =
@@ -873,6 +970,13 @@ void runCommunicationSchedule(uint32_t nowMs)
         Serial.println("SOLO startup configuration verified");
       }
     }
+    return;
+  }
+
+  // Identification owns the CANopen schedule so normal speed commands cannot
+  // enable the drive while SOLO is injecting its motor test signal.
+  if (motorIdentificationState != MotorIdentificationState::IDLE) {
+    runMotorIdentification(nowMs);
     return;
   }
 
@@ -1090,6 +1194,15 @@ void printStatus()
   Serial.print(" | regen limit: ");
   Serial.print(soloRegenerationCurrentLimitA, 2);
   Serial.print(" A");
+  Serial.print(" | identified current Kp/Ki: ");
+  if (isfinite(identifiedCurrentKp) && isfinite(identifiedCurrentKi)) {
+    Serial.print(identifiedCurrentKp, 7);
+    Serial.print(" / ");
+    Serial.print(identifiedCurrentKi, 7);
+  }
+  else {
+    Serial.print("PENDING");
+  }
   Serial.print(" | start monitor: ");
   if (startFailureFaultLatched) Serial.print("FAULT");
   else if (startFailureStartTimeMs != 0) Serial.print("TIMING");
@@ -1172,8 +1285,38 @@ void handleUSBSerial()
       Serial.println("SOLO error-clear request failed");
     }
   }
+  else if (compactCommand.equalsIgnoreCase("motor_identification")) {
+    const uint32_t nowMs = millis();
+    if (motorIdentificationState != MotorIdentificationState::IDLE) {
+      Serial.println("Motor identification is already running");
+    }
+    else if (filteredDuty >= START_DUTY_THRESHOLD) {
+      Serial.println(
+        "Identification rejected: set the Carvera spindle command to zero");
+    }
+    else if (!soloStartupConfigured || solo == nullptr ||
+             !telemetryIsFresh(lastSuccessfulCommunicationMs, nowMs)) {
+      Serial.println(
+        "Identification rejected: SOLO startup/CANopen is not ready");
+    }
+    else if (soloHasError || soloFaultLatched || communicationFaultLatched) {
+      Serial.println("Identification rejected: clear SOLO faults first");
+    }
+    else if (motorSequenceState != MotorSequenceState::STOPPED ||
+             soloDriveEnabled || lastSpeedReferenceSentRpm != 0.0f) {
+      Serial.println(
+        "Identification rejected: wait until the drive is fully stopped");
+    }
+    else {
+      identifiedCurrentKp = NAN;
+      identifiedCurrentKi = NAN;
+      motorIdentificationState =
+        MotorIdentificationState::START_REQUESTED;
+      Serial.println("Motor identification request accepted");
+    }
+  }
   else if (compactCommand.equalsIgnoreCase("help")) {
-    Serial.println("Commands: status, clear_errors");
+    Serial.println("Commands: status, clear_errors, motor_identification");
   }
   else if (command.length() != 0) {
     Serial.println("Unknown command. Enter 'help'");
